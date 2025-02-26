@@ -156,42 +156,60 @@ class oldESMCProClassifier(nn.Module):
         # aggregated = self.aggregator(features).mean(dim=1)
         aggregated = torch.mean(features, dim=1)
         return self.class_head(aggregated)
-    
-    
-class ESMCProClassifier(nn.Module):
-    def __init__(self, num_classes=4, model_name="esmc_300m"):
+
+
+
+
+class AttentionPooling(nn.Module):
+    def __init__(self, input_dim):
         super().__init__()
-        self.esmc = ESMC.from_pretrained(model_name)
-                
-        # 配置LoRA
-        peft_config = LoraConfig(
-            task_type=TaskType.SEQ_CLS,
-            r=8,
-            lora_alpha=16,
-            lora_dropout=0.1,
-            # 根据ESMC模型中MultiHeadAttention的具体实现修改target_modules
-            target_modules=[
-                "layernorm_qkv.1",  # MultiHeadAttention中的线性层
-                "out_proj"          # MultiHeadAttention中的输出投影层
-            ],
-            inference_mode=False,
-            bias="none",
+        self.attention = nn.Sequential(
+            nn.Linear(input_dim, input_dim // 2),
+            nn.Tanh(),
+            nn.Linear(input_dim // 2, 1)
         )
         
-        # 将原始模型转换为LoRA模型
-        self.esmc = get_peft_model(self.esmc, peft_config)
-        # 冻结除了LoRA参数之外的其他参数
-        for param in self.esmc.parameters():
-            if not getattr(param, "is_lora", False):
-                param.requires_grad = False
-        
+    def forward(self, features):
+        # features: (B, 5000, 512)
+        attention_weights = self.attention(features)  # (B, 5000, 1)
+        attention_weights = F.softmax(attention_weights, dim=1)  # (B, 5000, 1)
+        weighted_features = features * attention_weights  # (B, 5000, 512)
+        return weighted_features.sum(dim=1)  # (B, 512)
+
+
+    
+class ESMCProClassifier(nn.Module):
+    def __init__(self, num_classes=4, model_name="esmc_300m", is_load_lora = False, lora_model = None):
+        super().__init__()
+        if not is_load_lora:
+            self.esmc = ESMC.from_pretrained(model_name)
+                    
+            # 配置LoRA
+            peft_config = LoraConfig(
+                task_type=TaskType.FEATURE_EXTRACTION,
+                r=16,
+                lora_alpha=16,
+                lora_dropout=0.05,
+                # 根据ESMC模型中MultiHeadAttention的具体实现修改target_modules
+                target_modules=[
+                    "layernorm_qkv.1",  # MultiHeadAttention中的线性层
+                    "out_proj"          # MultiHeadAttention中的输出投影层
+                ],
+                inference_mode=False,
+            )
+            # 将原始模型转换为LoRA模型
+            self.esmc = get_peft_model(self.esmc, peft_config)
+        else:
+            self.esmc = lora_model
+            
+        self.esmc.print_trainable_parameters()
         # 特征处理层
         self.feat_proj = nn.Sequential(
             nn.LayerNorm(self.esmc.embed.embedding_dim),
             nn.Linear(self.esmc.embed.embedding_dim, 512),
             nn.GELU()
         )
-
+        self.attn_pooling = AttentionPooling(512)
         self.class_head = nn.Linear(512, num_classes)
 
 
@@ -203,8 +221,8 @@ class ESMCProClassifier(nn.Module):
             tokens = self.esmc._tokenize(sample_seq)  # (5000, seq_len)
             sequence_id = tokens != self.esmc.tokenizer.pad_token_id
             x = self.esmc.embed(tokens)
-            x, _, hiddens = self.esmc.transformer(x, sequence_id=sequence_id)
-            hiddens = torch.stack(hiddens, dim=0)
+            x, last_hidden, _ = self.esmc.transformer(x, sequence_id=sequence_id)
+
             
             # output = self.esmc(tokens)
             # _, _, hiddens = (
@@ -215,12 +233,13 @@ class ESMCProClassifier(nn.Module):
             
             
             # 使用最终隐藏层
-            seq_feats = torch.mean(hiddens[-1], dim=1)  # (5000, d_model)
+            seq_feats = torch.mean(last_hidden, dim=1)  # (5000, d_model)
             batch_feats.append(self.feat_proj(seq_feats))
             
         return torch.stack(batch_feats)  # (B, 5000, 512)
 
     def forward(self, batch_sequences):
         features = self.get_sequence_features(batch_sequences)
-        aggregated = torch.mean(features, dim=1)
+        # aggregated = torch.mean(features, dim=1)
+        aggregated = self.attn_pooling(features)
         return self.class_head(aggregated)

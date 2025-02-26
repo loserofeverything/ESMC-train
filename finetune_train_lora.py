@@ -11,11 +11,40 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 import tqdm
 import random
+import string
 from torch.cuda.amp import autocast, GradScaler
-from peft import PeftModel
+from peft import PeftModel, PeftConfig
 from esm.tokenization import EsmSequenceTokenizer
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+
+def generate_random_string(length=13):
+    """生成指定长度的随机字符串，模拟类似 'CASSLGQAYEQYF' 的字符串"""
+    return ''.join(random.choice(string.ascii_uppercase) for _ in range(length))
+
+def generate_dummy_inputs(k, d):
+    """生成形状为 (k, d) 的二维列表，每个元素都是随机字符串"""
+    return [[generate_random_string() for _ in range(d)] for _ in range(k)]
+
+def count_parameters(model):
+    """统计模型参数量"""
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"总参数量: {total_params:,} ({total_params/1e6:.2f}M)")
+    print(f"可训练参数量: {trainable_params:,} ({trainable_params/1e6:.2f}M)")
+    print(f"固定参数量: {total_params - trainable_params:,} ({(total_params - trainable_params)/1e6:.2f}M)")
+    return total_params, trainable_params
+
+
+def monitor_gpu_memory():
+    """监控GPU显存使用情况"""
+    torch.cuda.synchronize()
+    current = torch.cuda.memory_allocated() / 1024**2
+    peak = torch.cuda.max_memory_allocated() / 1024**2
+    print(f"当前显存占用: {current:.2f} MB")
+    print(f"峰值显存占用: {peak:.2f} MB")
+    return current, peak
 
 
 def save_checkpoint(model, optimizer, epoch, path):
@@ -44,7 +73,8 @@ def save_model(model, save_path):
     # 保存其他自定义层
     other_weights = {
         'feat_proj': model.feat_proj.state_dict(),
-        'class_head': model.class_head.state_dict()
+        'class_head': model.class_head.state_dict(),
+        'attn_pooling': model.attn_pooling.state_dict()
     }
     torch.save(other_weights, os.path.join(save_path, 'other_weights.pt'))
 
@@ -58,14 +88,10 @@ def load_model(base_model_name, lora_weights_path, num_classes):
     3. 其他自定义层的权重
     """
     # 首先创建基础模型
-    model = ESMCProClassifier(num_classes=num_classes, model_name=base_model_name)
-    
-    # 加载LoRA权重
-    model.esmc = PeftModel.from_pretrained(
-        model.esmc,
-        lora_weights_path,
-        is_trainable=True
-    )
+    # model = ESMCProClassifier(num_classes=num_classes, model_name=base_model_name)
+    esmc_model = ESMC.from_pretrained(base_model_name)
+    lora_esmc = PeftModel.from_pretrained(esmc_model, lora_weights_path)
+    model = ESMCProClassifier(num_classes=num_classes, is_load_lora=True, lora_model=lora_esmc)
     
     # 加载其他自定义层权重
     other_weights = torch.load(os.path.join(lora_weights_path, 'other_weights.pt'))
@@ -254,8 +280,29 @@ if __name__ == "__main__":
         model = ESMCProClassifier(num_classes=split, model_name="esmc_300m")
         model = model.to(torch.bfloat16)
         model = model.to(device)
+        
+        
+        
+        
+        # 添加以下代码
+        print("=" * 50)
+        print("模型参数统计:")
+        count_parameters(model)
+        print("-" * 50)
+        print("模型载入后显存占用:")
+        before_run = monitor_gpu_memory()
+        
+        
+        # dummy_input = generate_dummy_inputs(1,1400)
+        # _ = model(dummy_input)
+        # print("-" * 50)
+        # print("前向传播后显存占用:")
+        # after_run = monitor_gpu_memory()
+        # print(f"单次前向传播增加显存: {after_run[0] - before_run[0]:.2f} MB")
+        
+        
         freqs = torch.tensor([672, 898, 452, 463], dtype=torch.bfloat16)
-        class_weights = 1.0 / (torch.log(1.02 + freqs))  # 示例：可根据需要调整
+        class_weights = 1.0 / torch.sqrt(freqs)  # 平方根
         class_weights = class_weights.to(device)
         criterion = nn.CrossEntropyLoss(weight=class_weights)
         optimizer = optim.AdamW([
@@ -271,11 +318,10 @@ if __name__ == "__main__":
         train_dataset.set_seqOrNot(False)
         test_dataset.set_seqOrNot(False)
         
-        train_loader = DataLoader(train_dataset, batch_size=3, shuffle=True, pin_memory=True,collate_fn=collate_fn, num_workers=4)
-        test_loader = DataLoader(test_dataset, batch_size=3, shuffle=False, pin_memory=True, collate_fn=collate_fn, num_workers=4)
+        train_loader = DataLoader(train_dataset, batch_size=1, shuffle=True, pin_memory=True,collate_fn=collate_fn, num_workers=4)
+        test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, pin_memory=True, collate_fn=collate_fn, num_workers=4)
 
-        
-        accum_steps = 8
+        accumulation_steps = 8
         train_losses = []
         min_loss = float('inf')
         max_auc = 0
@@ -286,13 +332,7 @@ if __name__ == "__main__":
         val_auces = []
         val_acces = []
         val_losses = []
-        total_epochs = 1
-
-        # save_checkpoint(model, optimizer, 0, "/root/autodl-tmp/ESM/testsave.pth")
-
-        # ckp_path = os.path.join(model_save_path, "epoch_{}_acc_{}".format(0, 0))
-        # save_model(model, ckp_path)
-        # print(f"模型已保存到：{ckp_path}")
+        total_epochs = 100
         
         
         for epoch in range(total_epochs):
@@ -301,44 +341,29 @@ if __name__ == "__main__":
             all_labels = []
             loss_sum = 0.0
             step_count = 0
-            # total_layers = len(model.esmc.transformer.blocks)
-            
-            # if epoch <= 3:
-            #     freeze_num = total_layers
-            #     model._freeze_transformer(freeze_num)
-            #     optimizer.param_groups[0]['lr'] = 0
-            #     optimizer.param_groups[1]['lr'] = 0
                 
-            # elif epoch <= 10:
-            #     freeze_num = total_layers - 4
-            #     model._freeze_transformer(freeze_num)
-            #     optimizer.add_param_group({
-            #         'params': [p for p in model.esmc.parameters() if p.requires_grad],
-            #         'lr': 1e-5
-            #     })
-            # else:
-            #     freeze_num = 0
-            #     model._freeze_transformer(freeze_num)
-            #     optimizer.param_groups[-1]['lr'] = 1e-6
-                
-            
+            optimizer.zero_grad()
             for batch_idx, (sid, fid, label, cdr3) in tqdm.tqdm(enumerate(train_loader), \
             desc="Train epoch {}".format(epoch), total=len(train_loader)):
                 
                 batch_size = label.shape[0]
                 label = label.to(device)
-                optimizer.zero_grad()
+                
                 outputs = model(cdr3)
-                loss = criterion(outputs, label)
+                # 修改：将损失除以累积步数，确保梯度规模正确
+                loss = criterion(outputs, label) / accumulation_steps
                 loss.backward()
-                optimizer.step()
-                loss_sum += loss.item()
+                
+                loss_sum += loss.item() * accumulation_steps  # 恢复原始损失大小以便记录
                 step_count += 1
                         
                 logits = F.softmax(outputs.float(), dim=1).cpu().detach().numpy()
                 all_preds.extend(logits)
                 all_labels.extend(label.cpu().numpy())
-                
+                # 修改：只有达到累积步数或是最后一个批次时才更新参数
+                if (batch_idx + 1) % accumulation_steps == 0 or (batch_idx + 1) == len(train_loader):
+                    optimizer.step()
+                    optimizer.zero_grad()
                 
             if split == 2:
                 auc_value = calculate_auc(all_preds, all_labels)
@@ -422,13 +447,13 @@ if __name__ == "__main__":
             if accuracy > max_acc:
                 max_acc = accuracy
                 ckp_path = os.path.join(model_save_path, "epoch_{}_acc_{}".format(epoch, accuracy))
-                save_checkpoint(model, optimizer, epoch, ckp_path)
+                save_model(model, ckp_path)
                 print(f"模型已保存到：{ckp_path}")
                 
                 
             elif epoch%save_interval==0:
                 ckp_path = os.path.join(model_save_path, "epoch_{}_acc_{}".format(epoch, accuracy))
-                save_checkpoint(model, optimizer, epoch, ckp_path)
+                save_model(model, ckp_path)
                 print(f"模型已保存到：{ckp_path}")
             
             print("训练完成")
