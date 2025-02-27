@@ -52,6 +52,7 @@ class dataset(Dataset):
         self.file_label_list = file_label_list
         self.exclude_k = exclude_k
         self.k = topk
+        self.total_samples = 2589
         self.mode = mode
         self.split = split
         self.is_load_encoded = is_load_encoded
@@ -77,6 +78,10 @@ class dataset(Dataset):
     def load_h5_file(self):
       with h5py.File(self.h5_file, 'r') as f:
         self.clone_fractions = f['clone_fractions'][:]
+        selected_fractions = []
+        selected_cdr3s = []
+        selected_lens = []
+        selected_labels = []
         self.labels = f['labels'][:]
         if self.is_load_filenames:
             self.file_names = f['file_names'][:]
@@ -85,7 +90,27 @@ class dataset(Dataset):
         self.cdr3_seq = f['cdr3_seq'][:]
         self.data_indices = f['data_indices'][:]
         self.seq_lens = f['seq_lens'][:]
+        for i in range(self.total_samples):
+            start_idx = i * self.k
+            end_idx = start_idx + self.k
+            sample_fractions = self.clone_fractions[start_idx: end_idx]
+            sample_cdr3 = self.cdr3_seq[start_idx: end_idx]
+            sample_lens = self.seq_lens[start_idx: end_idx]
+            sample_labels = self.labels[start_idx: end_idx]
+            # 按克隆比例降序排序并获取前topk个索引
+            top_local_indices = np.argsort(sample_fractions)[::-1][:1000]
+            # global_indices = top_local_indices + start_idx
+            
+            selected_fractions.extend(sample_fractions[top_local_indices])
+            selected_cdr3s.extend(sample_cdr3[top_local_indices])
+            selected_lens.extend(sample_lens[top_local_indices])
+            selected_labels.extend(sample_labels[top_local_indices])
         
+        self.clone_fractions = np.array(selected_fractions)
+        self.cdr3_seq = np.array(selected_cdr3s)
+        self.seq_lens = np.array(selected_lens)
+        self.labels = np.array(selected_labels)
+            
         if self.exclude_k is not None:
             # 处理单个数值或列表输入
             if isinstance(self.exclude_k, (int, float)):
@@ -107,6 +132,7 @@ class dataset(Dataset):
             self.cdr3_seq = self.cdr3_seq[indices]
         
         self.corpus_lines = len(self.labels)
+        self.k = 1000
         
 
   
